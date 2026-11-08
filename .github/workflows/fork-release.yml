@@ -1,0 +1,235 @@
+name: Fork Sync Release
+
+# zhnsanso/Sesame-AG 自动同步上游 Sesame-AG/Sesame-AG 的 dev 分支并发布 APK。
+#
+# 分支模型（重要）：
+#   - main：默认分支，承载本 workflow 文件（定时任务只读默认分支上的 workflow）
+#   - sync ：upstream/dev 的纯镜像，绝不放置 fork 自己的提交，
+#            同步方式为纯 ref 快进推送（git push <sha>:refs/heads/sync）
+# 这样保证 sync 与上游永远可无损快进，且"无变化跳过"判定（HEAD == upstream/dev）成立。
+
+on:
+  schedule:
+    # 每周一 03:00 UTC（北京时间周一 11:00）
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: "即使上游无新提交也强制重新构建发布（同版本覆盖上传）"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-sync-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: https://github.com/Sesame-AG/Sesame-AG.git
+  UPSTREAM_BRANCH: dev
+  JAVA_DISTRIBUTION: oracle
+  JAVA_VERSION: "17.0.1"
+  ANDROID_PLATFORM: android-37.0
+  ANDROID_BUILD_TOOLS: 37.0.0
+  APK_DIR: app/build/outputs/apk/release
+
+jobs:
+  sync-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sync branch
+        uses: actions/checkout@v4
+        with:
+          ref: sync
+          fetch-depth: 0
+
+      - name: Decide whether to build
+        id: decide
+        run: |
+          set -euo pipefail
+          git remote add upstream "$UPSTREAM_REPO"
+          git fetch upstream "$UPSTREAM_BRANCH" --tags
+          upstream_sha="$(git rev-parse FETCH_HEAD)"
+          local_sha="$(git rev-parse HEAD)"
+
+          # 用上游提交里的 gradle.properties 计算 tag（防止本地仍是旧版本时读错）
+          app_version="$(git show "$upstream_sha":gradle.properties | sed -n 's/^appVersion=//p' | head -n1 | tr -d '\r')"
+          short_sha="$(git rev-parse --short=7 "$upstream_sha")"
+          tag="v${app_version}-g${short_sha}"
+          force="${{ inputs.force_build == true }}"
+
+          # 上游无新提交、该版本的 Release 已存在、且非强制 -> 跳过
+          if [[ "$local_sha" == "$upstream_sha" && "$force" != "true" ]] \
+             && git ls-remote --tags origin "refs/tags/$tag" | grep -q .; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "Upstream unchanged ($upstream_sha) and release $tag exists. Skipping."
+            exit 0
+          fi
+
+          echo "build=true" >> "$GITHUB_OUTPUT"
+          # 镜像分支快进：纯 ref 推送 + 本地 hard reset（无 merge，无本地提交）
+          if [[ "$local_sha" != "$upstream_sha" ]]; then
+            git push origin "${upstream_sha}:refs/heads/sync"
+            git reset --hard "$upstream_sha"
+          fi
+
+          echo "SYNCED_SHA=$upstream_sha" >> "$GITHUB_ENV"
+          echo "APP_VERSION=$app_version" >> "$GITHUB_ENV"
+          echo "SHORT_SHA=$short_sha" >> "$GITHUB_ENV"
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+
+      # ---------- 以下步骤仅在需要构建时执行 ----------
+
+      - name: Set up JDK
+        if: steps.decide.outputs.build == 'true'
+        uses: actions/setup-java@v5
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+          architecture: x64
+          cache: gradle
+
+      - name: Set up Android SDK
+        if: steps.decide.outputs.build == 'true'
+        uses: android-actions/setup-android@v3
+        with:
+          packages: ""
+
+      - name: Install SDK packages
+        if: steps.decide.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;${ANDROID_PLATFORM}" \
+            "build-tools;${ANDROID_BUILD_TOOLS}"
+          set +o pipefail
+          yes | sdkmanager --licenses >/dev/null
+          set -o pipefail
+
+      - name: Set up Gradle
+        if: steps.decide.outputs.build == 'true'
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+          gradle-version: wrapper
+
+      - name: Build release APKs
+        if: steps.decide.outputs.build == 'true'
+        run: |
+          set -uo pipefail
+          chmod +x gradlew
+          # 重试 3 次：services.gradle.org 发行包下载偶发超时（首次成功后会被 setup-gradle 缓存）
+          for attempt in 1 2 3; do
+            if ./gradlew --no-daemon --stacktrace :app:assembleRelease; then
+              break
+            fi
+            if [[ "$attempt" == "3" ]]; then
+              echo "Gradle build failed after 3 attempts"
+              exit 1
+            fi
+            echo "Build attempt $attempt failed (likely wrapper/dependency download timeout). Retrying in 30s..."
+            sleep 30
+          done
+          ls -l "$APK_DIR"
+
+      - name: Sign arm64-v8a and universal APKs
+        if: steps.decide.outputs.build == 'true'
+        env:
+          KS_PASS: ${{ secrets.FORK_KEYSTORE_PASSWORD }}
+          KEY_PASS: ${{ secrets.FORK_KEY_PASSWORD }}
+          KS_ALIAS: ${{ secrets.FORK_KEY_ALIAS }}
+          KS_PATH: ${{ runner.temp }}/fork.jks
+        run: |
+          set -euo pipefail
+          printf '%s' "${{ secrets.FORK_KEYSTORE_BASE64 }}" | base64 -d > "$KS_PATH"
+          sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          bt="$sdk_root/build-tools/$ANDROID_BUILD_TOOLS"
+          apksigner="$bt/apksigner"
+          zipalign="$bt/zipalign"
+
+          version_code="$(git rev-list --count HEAD)"
+          echo "VERSION_CODE=$version_code" >> "$GITHUB_ENV"
+
+          mkdir -p "$RUNNER_TEMP/signed"
+          for abi in arm64-v8a universal; do
+            src="$APK_DIR/app-${abi}-release.apk"
+            [[ -f "$src" ]] || { echo "APK not found: $src"; ls -l "$APK_DIR"; exit 1; }
+            out="$RUNNER_TEMP/signed/Sesame-AG-v${APP_VERSION}-${abi}.apk"
+            "$zipalign" -f -p 4 "$src" "$out.tmp"
+            "$apksigner" sign \
+              --ks "$KS_PATH" --ks-key-alias "$KS_ALIAS" \
+              --ks-pass "pass:$KS_PASS" --key-pass "pass:$KEY_PASS" \
+              --out "$out" "$out.tmp"
+            "$apksigner" verify "$out"
+            rm -f "$out.tmp"
+          done
+          ls -l "$RUNNER_TEMP/signed"
+
+      - name: Create tag (skip if exists)
+        if: steps.decide.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          if git ls-remote --tags origin "refs/tags/$TAG" | grep -q .; then
+            echo "Tag $TAG already exists, skipping tag creation."
+            exit 0
+          fi
+          git tag "$TAG" "$SYNCED_SHA"
+          git push origin "refs/tags/$TAG"
+
+      - name: Create or update GitHub Release
+        if: steps.decide.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          body="$RUNNER_TEMP/release-body.md"
+          upstream_link="https://github.com/Sesame-AG/Sesame-AG/commit/$SYNCED_SHA"
+          {
+            echo "## Sesame-AG v${APP_VERSION}（上游同步构建）"
+            echo
+            echo "- 上游版本：v${APP_VERSION} / versionCode ${VERSION_CODE}"
+            echo "- 上游提交：[\`$SHORT_SHA\`]($upstream_link)"
+            echo "- 同步分支：\`sync\`（对 upstream/dev 的纯快进镜像，无任何代码修改）"
+            echo
+            echo "### 下载"
+            echo
+            echo "- **arm64-v8a** — 主流 64 位手机"
+            echo "- **universal** — 通用版（不确定就选这个）"
+            echo
+            echo "### 声明"
+            echo
+            echo "- ⚠️ 非官方构建：由 fork [\`zhnsanso/Sesame-AG\`](https://github.com/zhnsanso/Sesame-AG) 自动同步构建，使用 fork 自有证书签名，与 Sesame-AG 维护团队无关。"
+            echo "- 源码（AGPL-3.0）：[$upstream_link]($upstream_link)"
+            echo "- 签名证书 SHA-256：\`E3CA64C831298F932926EFF5FFD2F161CBDA401C6BB043E6F6A157523D4690B9\`（可用 \`apksigner verify --print-certs\` 核验）"
+          } > "$body"
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG exists, updating assets."
+            gh release upload "$TAG" "$RUNNER_TEMP/signed"/*.apk --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" "$RUNNER_TEMP/signed"/*.apk \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Sesame-AG v${APP_VERSION} (upstream $SHORT_SHA)" \
+              --notes-file "$body" \
+              --latest
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          if [[ "${{ steps.decide.outputs.build }}" == "true" ]]; then
+            {
+              echo "## Fork Sync Release"
+              echo
+              echo "- 结果：\`$TAG\` 已构建并发布（上游 \`$SHORT_SHA\`，versionCode ${VERSION_CODE:-?}）"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "## Fork Sync Release"
+              echo
+              echo "- 结果：上游无新提交且 Release 已存在，本次跳过"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
